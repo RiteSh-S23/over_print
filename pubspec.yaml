@@ -17,7 +17,6 @@ dependencies:
   share_plus: ^10.1.2
   path_provider: ^2.1.4
   web: ^1.1.0
-  flutter_launcher_icons: ^0.13.1
 
 
 dev_dependencies:
@@ -25,6 +24,7 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^4.0.0
   flutter_native_splash: ^2.4.1
+  flutter_launcher_icons: ^0.13.1
 
 
 # For information on the generic Dart part of this file, see the
@@ -38,26 +38,43 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  # Flutter does NOT include sub-folders automatically, so every folder
+  # that holds assets must be listed on its own line.
+  assets:
+    - assets/
+    - assets/icon/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
 
-# Configure the icon settings
+# App icon (run: dart run flutter_launcher_icons)
 flutter_launcher_icons:
   android: "launcher_icon"
-  ios: true # Set to true if you want to generate for iOS at the same time
+  ios: true
   image_path: "assets/icon/app_icon.png"
+  # Android 8+ adaptive icon: the foreground has a transparent background and
+  # its artwork sits inside the safe zone, so the system can mask it into a
+  # circle, squircle, etc. over the solid navy background colour.
+  adaptive_icon_background: "#12284C"
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+  # iOS does not allow transparency; use the flattened square version.
+  image_path_ios: "assets/icon/app_icon_ios.png"
+  remove_alpha_ios: true
+  min_sdk_android: 21
 
+# Splash screen (run: dart run flutter_native_splash:create)
 flutter_native_splash:
-  color: "#0D5C55"
+  color: "#12284C"
+  color_dark: "#12284C"
   image: assets/icon/icon_foreground.png
+  image_dark: assets/icon/icon_foreground.png
   android: true
   ios: false
   web: false
   android_12:
-    color: "#0D5C55"
+    color: "#12284C"
+    color_dark: "#12284C"
     image: assets/icon/icon_foreground.png
+    image_dark: assets/icon/icon_foreground.png
+    icon_background_color: "#12284C"
+    icon_background_color_dark: "#12284C"
