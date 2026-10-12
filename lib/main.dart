@@ -1,16 +1,12 @@
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
-import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
-
-import 'download_stub.dart' if (dart.library.js_interop) 'download_web.dart';
 
 void main() => runApp(const OverprintApp());
 
@@ -39,10 +35,12 @@ class OverprintApp extends StatelessWidget {
 
 enum WmStyle { diagonal, straight, tiled }
 
-/// Arguments for the background isolate (must be plain data).
+/// Arguments for the background isolate (plain data only: paths, not bytes).
 class _Job {
-  _Job(this.bytes, this.text, this.style, this.sizePct, this.opacity, this.color);
-  final Uint8List bytes;
+  _Job(this.inPath, this.outPath, this.text, this.style, this.sizePct,
+      this.opacity, this.color);
+  final String inPath;
+  final String outPath;
   final String text;
   final int style; // WmStyle index
   final double sizePct; // 0.04 - 0.24 of page width
@@ -50,86 +48,102 @@ class _Job {
   final int color; // ARGB
 }
 
-/// Adds the watermark to every page and returns the new PDF bytes.
-Uint8List _applyWatermark(_Job job) {
-  final doc = PdfDocument(inputBytes: job.bytes);
+/// Reads the PDF from disk, watermarks every page, writes the result to disk
+/// and returns the output path. No PDF bytes ever cross the isolate boundary.
+String _applyWatermark(_Job job) {
+  final doc = PdfDocument(inputBytes: File(job.inPath).readAsBytesSync());
   final style = WmStyle.values[job.style];
-  final r = (job.color >> 16) & 0xFF, g = (job.color >> 8) & 0xFF, b = job.color & 0xFF;
+  final r = (job.color >> 16) & 0xFF,
+      g = (job.color >> 8) & 0xFF,
+      b = job.color & 0xFF;
 
-  for (var i = 0; i < doc.pages.count; i++) {
-    final page = doc.pages[i];
-    final size = page.getClientSize();
-    final w = size.width, h = size.height;
-
-    var fontSize = w * job.sizePct * (style == WmStyle.tiled ? 0.45 : 1.0);
-    var font = PdfStandardFont(PdfFontFamily.helvetica, fontSize, style: PdfFontStyle.bold);
-    var ts = font.measureString(job.text);
-    final cap = style == WmStyle.diagonal
-        ? w * 1.15
-        : style == WmStyle.straight
-        ? w * 0.9
-        : double.infinity;
-    if (ts.width > cap) {
-      fontSize = fontSize * cap / ts.width;
-      font = PdfStandardFont(PdfFontFamily.helvetica, fontSize, style: PdfFontStyle.bold);
-      ts = font.measureString(job.text);
-    }
-
-    final gfx = page.graphics;
+  try {
     final brush = PdfSolidBrush(PdfColor(r, g, b));
-    gfx.save();
-    gfx.setTransparency(job.opacity);
-    gfx.translateTransform(w / 2, h / 2);
+    // Fonts are cached per page width to avoid re-creating them for
+    // documents where every page has the same size.
+    double? lastW;
+    PdfStandardFont? font;
+    Size? ts;
+    double fontSize = 0;
 
-    void drawAt(double x, double y) {
-      gfx.drawString(
-        job.text,
-        font,
-        brush: brush,
-        bounds: Rect.fromLTWH(x - ts.width / 2, y - ts.height / 2, ts.width, ts.height),
-      );
-    }
+    for (var i = 0; i < doc.pages.count; i++) {
+      final page = doc.pages[i];
+      final size = page.getClientSize();
+      final w = size.width, h = size.height;
 
-    if (style == WmStyle.diagonal) {
-      gfx.rotateTransform(-45);
-      drawAt(0, 0);
-    } else if (style == WmStyle.straight) {
-      drawAt(0, 0);
-    } else {
-      gfx.rotateTransform(-30);
-      final reach = math.sqrt(w * w + h * h) / 2 + ts.width;
-      final sx = ts.width * 1.35 + ts.height;
-      final sy = ts.height * 4.2;
-      var row = 0;
-      for (var y = -reach; y <= reach; y += sy, row++) {
-        final off = row.isOdd ? sx / 2 : 0.0;
-        for (var x = -reach + off; x <= reach; x += sx) {
-          drawAt(x, y);
+      if (lastW != w || font == null || ts == null) {
+        fontSize = w * job.sizePct * (style == WmStyle.tiled ? 0.45 : 1.0);
+        font = PdfStandardFont(PdfFontFamily.helvetica, fontSize,
+            style: PdfFontStyle.bold);
+        ts = font.measureString(job.text);
+        final cap = style == WmStyle.diagonal
+            ? w * 1.15
+            : style == WmStyle.straight
+            ? w * 0.9
+            : double.infinity;
+        if (ts.width > cap) {
+          fontSize = fontSize * cap / ts.width;
+          font = PdfStandardFont(PdfFontFamily.helvetica, fontSize,
+              style: PdfFontStyle.bold);
+          ts = font.measureString(job.text);
+        }
+        lastW = w;
+      }
+
+      final f = font;
+      final t = ts;
+      final gfx = page.graphics;
+      gfx.save();
+      gfx.setTransparency(job.opacity);
+      gfx.translateTransform(w / 2, h / 2);
+
+      void drawAt(double x, double y) {
+        gfx.drawString(
+          job.text,
+          f,
+          brush: brush,
+          bounds: Rect.fromLTWH(x - t.width / 2, y - t.height / 2, t.width, t.height),
+        );
+      }
+
+      if (style == WmStyle.diagonal) {
+        gfx.rotateTransform(-45);
+        drawAt(0, 0);
+      } else if (style == WmStyle.straight) {
+        drawAt(0, 0);
+      } else {
+        gfx.rotateTransform(-30);
+        final reach = math.sqrt(w * w + h * h) / 2 + t.width;
+        final sx = t.width * 1.35 + t.height;
+        final sy = t.height * 4.2;
+        var row = 0;
+        for (var y = -reach; y <= reach; y += sy, row++) {
+          final off = row.isOdd ? sx / 2 : 0.0;
+          for (var x = -reach + off; x <= reach; x += sx) {
+            drawAt(x, y);
+          }
         }
       }
+      gfx.restore();
     }
-    gfx.restore();
+
+    File(job.outPath).writeAsBytesSync(doc.saveSync(), flush: true);
+    return job.outPath;
+  } finally {
+    doc.dispose();
   }
-
-  final out = Uint8List.fromList(doc.saveSync());
-  doc.dispose();
-  return out;
 }
 
-int _countPages(Uint8List bytes) {
-  final doc = PdfDocument(inputBytes: bytes);
-  final n = doc.pages.count;
-  doc.dispose();
-  return n;
-}
-
-/// One uploaded PDF and (once processed) its watermarked result.
+/// One selected PDF (kept on disk) and, once processed, its output file.
 class _PdfItem {
-  _PdfItem(this.name, this.bytes, this.pages);
+  _PdfItem(this.id, this.name, this.path, this.size);
+
+  final int id;
   final String name;
-  final Uint8List bytes;
-  final int pages;
-  Uint8List? result;
+  final String path;
+  final int size;
+
+  String? outPath;
   bool failed = false;
 
   String get outName =>
@@ -144,9 +158,11 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final _text = TextEditingController();
+  static const int _maxBytes = 400 * 1024 * 1024;
 
+  final _text = TextEditingController();
   final List<_PdfItem> _items = [];
+  int _nextId = 0;
 
   WmStyle _style = WmStyle.diagonal;
   double _size = 12; // percent of page width
@@ -165,7 +181,7 @@ class _HomePageState extends State<HomePage> {
     'Black': Color(0xFF111111),
   };
 
-  List<_PdfItem> get _ready => _items.where((e) => e.result != null).toList();
+  List<_PdfItem> get _ready => _items.where((e) => e.outPath != null).toList();
 
   @override
   void dispose() {
@@ -174,18 +190,36 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _say(String? msg, {bool error = false}) {
+    if (!mounted) return;
     setState(() {
       _message = msg;
       _error = error;
     });
   }
 
-  /// Clears previously generated results when any setting changes.
+  void _deleteOutput(_PdfItem i) {
+    final p = i.outPath;
+    if (p != null) {
+      try {
+        File(p).deleteSync();
+      } catch (_) {}
+    }
+    i.outPath = null;
+    i.failed = false;
+  }
+
+  /// Deletes previously generated files when any setting changes.
   void _invalidate() {
     for (final i in _items) {
-      i.result = null;
-      i.failed = false;
+      _deleteOutput(i);
     }
+  }
+
+  Future<Directory> _outDir() async {
+    final base = await getTemporaryDirectory();
+    final dir = Directory('${base.path}/overprint_out');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
   }
 
   Future<void> _pick() async {
@@ -194,35 +228,35 @@ class _HomePageState extends State<HomePage> {
         type: FileType.custom,
         allowedExtensions: const ['pdf'],
         allowMultiple: true,
-        withData: true,
+        withData: false, // never load file contents into memory
       );
       if (res == null || res.files.isEmpty) return;
 
       final added = <_PdfItem>[];
-      var failed = 0;
+      var tooBig = 0, unreadable = 0;
+
       for (final f in res.files) {
-        try {
-          final bytes =
-              f.bytes ?? (f.path != null ? await File(f.path!).readAsBytes() : null);
-          if (bytes == null) {
-            failed++;
-            continue;
-          }
-          final pages = await compute(_countPages, bytes);
-          added.add(_PdfItem(f.name, bytes, pages));
-        } catch (_) {
-          failed++;
+        final path = f.path;
+        if (path == null) {
+          unreadable++;
+          continue;
         }
+        if (f.size > _maxBytes) {
+          tooBig++;
+          continue;
+        }
+        added.add(_PdfItem(_nextId++, f.name, path, f.size));
       }
 
+      if (!mounted) return;
       setState(() {
-        _items.addAll(added);
         _invalidate();
-        _message = failed == 0
-            ? null
-            : '$failed ${failed == 1 ? 'file' : 'files'} could not be opened. '
-            'They may be damaged or password protected.';
-        _error = failed > 0;
+        _items.addAll(added);
+        final problems = <String>[];
+        if (tooBig > 0) problems.add('$tooBig over 400 MB');
+        if (unreadable > 0) problems.add('$unreadable could not be read');
+        _message = problems.isEmpty ? null : 'Skipped: ${problems.join(', ')}.';
+        _error = problems.isNotEmpty;
       });
     } catch (_) {
       _say('The files could not be read. Try choosing them again.', error: true);
@@ -231,16 +265,22 @@ class _HomePageState extends State<HomePage> {
 
   void _remove(int index) {
     setState(() {
+      _deleteOutput(_items[index]);
       _items.removeAt(index);
       _message = null;
     });
   }
 
-  void _clearAll() {
+  Future<void> _clearAll() async {
     setState(() {
+      _invalidate();
       _items.clear();
       _message = null;
     });
+    try {
+      // Frees the copies the picker made in the app cache.
+      await FilePicker.platform.clearTemporaryFiles();
+    } catch (_) {}
   }
 
   Future<void> _apply() async {
@@ -255,110 +295,67 @@ class _HomePageState extends State<HomePage> {
       _error = false;
     });
 
+    final dir = await _outDir();
     var failed = 0;
+
     for (var i = 0; i < _items.length; i++) {
       final item = _items[i];
+      if (!mounted) return;
       setState(() => _message = 'Processing ${i + 1} of ${_items.length}…');
+
       try {
-        item.result = await compute(
+        // One file at a time keeps peak memory to a single document.
+        item.outPath = await compute(
           _applyWatermark,
-          _Job(item.bytes, text, _style.index, _size / 100, _opacity / 100, _color.value),
+          _Job(
+            item.path,
+            '${dir.path}/${item.id}-${item.outName}',
+            text,
+            _style.index,
+            _size / 100,
+            _opacity / 100,
+            _color.value,
+          ),
         );
       } catch (_) {
         item.failed = true;
         failed++;
       }
+
+      if (!mounted) return;
       setState(() => _done = i + 1);
     }
 
     final ok = _items.length - failed;
+    if (!mounted) return;
     setState(() {
       _busy = false;
       if (failed == 0) {
         _message = 'Done. Watermark added to $ok ${ok == 1 ? 'PDF' : 'PDFs'}.';
         _error = false;
       } else {
-        _message = '$ok done, $failed failed. Use Latin letters and numbers, '
-            'or check that the failed PDFs are not protected.';
+        _message = '$ok done, $failed failed. The failed PDFs may be '
+            'password protected, damaged, or too large for this device\'s memory.';
         _error = ok == 0;
       }
     });
   }
 
-  Future<void> _saveBytes(Uint8List data, String fileName) async {
-    if (kIsWeb) {
-      try {
-        downloadBytes(data, fileName);
-        _say('Downloaded $fileName. Check your browser downloads.');
-      } catch (_) {
-        _say('The file could not be downloaded. Allow downloads for this site and try again.',
-            error: true);
-      }
-      return;
-    }
+  /// Opens the Android share sheet with the file(s) streamed from disk.
+  /// From there the user can pick "Save to device", Drive, WhatsApp, etc.
+  Future<void> _shareFiles(List<_PdfItem> items) async {
+    final files = [
+      for (final i in items)
+        if (i.outPath != null)
+          XFile(i.outPath!, mimeType: 'application/pdf', name: i.outName),
+    ];
+    if (files.isEmpty) return;
     try {
-      final isPdf = fileName.toLowerCase().endsWith('.pdf');
-      final path = await FilePicker.platform.saveFile(
-        dialogTitle: isPdf ? 'Save watermarked PDF' : 'Save ZIP',
-        fileName: fileName,
-        type: FileType.custom,
-        allowedExtensions: [isPdf ? 'pdf' : 'zip'],
-        bytes: data,
-      );
-      if (path != null || Platform.isAndroid || Platform.isIOS) {
-        _say('Saved $fileName.');
-      }
+      await Share.shareXFiles(files);
     } catch (_) {
-      _say('The file could not be saved. Try Share instead.', error: true);
+      _say('Could not open the share sheet. Try fewer files at a time.',
+          error: true);
     }
-  }
-
-  Future<void> _saveOne(_PdfItem item) async {
-    final out = item.result;
-    if (out == null) return;
-    await _saveBytes(out, item.outName);
-  }
-
-  Future<void> _saveAllZip() async {
-    final ready = _ready;
-    if (ready.isEmpty) return;
-    final archive = Archive();
-    final used = <String>{};
-    for (final item in ready) {
-      var name = item.outName;
-      var n = 2;
-      while (!used.add(name)) {
-        name = item.outName.replaceFirst(RegExp(r'\.pdf$'), '-$n.pdf');
-        n++;
-      }
-      archive.addFile(ArchiveFile(name, item.result!.length, item.result!));
-    }
-    final zipped = ZipEncoder().encode(archive);
-    if (zipped == null) {
-      _say('The ZIP file could not be created.', error: true);
-      return;
-    }
-    await _saveBytes(Uint8List.fromList(zipped), 'watermarked-pdfs.zip');
-  }
-
-  Future<void> _shareAll() async {
-    final ready = _ready;
-    if (ready.isEmpty) return;
-    final dir = await getTemporaryDirectory();
-    final files = <XFile>[];
-    final used = <String>{};
-    for (final item in ready) {
-      var name = item.outName;
-      var n = 2;
-      while (!used.add(name)) {
-        name = item.outName.replaceFirst(RegExp(r'\.pdf$'), '-$n.pdf');
-        n++;
-      }
-      final file = File('${dir.path}/$name');
-      await file.writeAsBytes(item.result!, flush: true);
-      files.add(XFile(file.path, mimeType: 'application/pdf'));
-    }
-    await Share.shareXFiles(files);
   }
 
   String _sizeLabel(int bytes) => bytes >= 1048576
@@ -370,7 +367,7 @@ class _HomePageState extends State<HomePage> {
     final cs = Theme.of(context).colorScheme;
     final canApply = _items.isNotEmpty && _text.text.trim().isNotEmpty && !_busy;
     final ready = _ready;
-    final totalPages = _items.fold<int>(0, (s, e) => s + e.pages);
+    final totalSize = _items.fold<int>(0, (s, e) => s + e.size);
 
     return Scaffold(
       appBar: AppBar(
@@ -490,7 +487,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 19),
                           const Text(
-                            'Make your\nGKYaadRahega PDFs.',
+                            'Make your PDFs \nStand Out.',
                             style: TextStyle(
                               color: Colors.white,
                               fontSize: 29,
@@ -600,7 +597,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 6),
                           const Text(
-                            'Select one or more PDFs from your device',
+                            'Select one or more PDFs (up to 400 MB each)',
                             style: TextStyle(
                               fontSize: 12,
                               color: Color(0xFF777B91),
@@ -657,9 +654,7 @@ class _HomePageState extends State<HomePage> {
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
-                                      '${_items[i].pages} '
-                                          '${_items[i].pages == 1 ? 'page' : 'pages'}'
-                                          '  •  ${_sizeLabel(_items[i].bytes.length)}',
+                                      _sizeLabel(_items[i].size),
                                       style: const TextStyle(
                                         fontSize: 11,
                                         color: Color(0xFF777B91),
@@ -668,7 +663,7 @@ class _HomePageState extends State<HomePage> {
                                   ],
                                 ),
                               ),
-                              if (_items[i].result != null)
+                              if (_items[i].outPath != null)
                                 const Padding(
                                   padding: EdgeInsets.only(right: 2),
                                   child: Icon(
@@ -724,7 +719,7 @@ class _HomePageState extends State<HomePage> {
                       const SizedBox(height: 8),
                       Text(
                         '${_items.length} ${_items.length == 1 ? 'file' : 'files'}'
-                            '  •  $totalPages ${totalPages == 1 ? 'page' : 'pages'} in total',
+                            '  •  ${_sizeLabel(totalSize)} in total',
                         textAlign: TextAlign.center,
                         style: const TextStyle(
                           fontSize: 11,
@@ -1008,10 +1003,20 @@ class _HomePageState extends State<HomePage> {
                       ),
                       if (_busy) ...[
                         const SizedBox(height: 15),
-                        LinearProgressIndicator(
-                          value: _items.isEmpty ? null : _done / _items.length,
-                          borderRadius: const BorderRadius.all(Radius.circular(8)),
-                          color: const Color(0xFF5145E5),
+                        // Indeterminate: a single large file has no
+                        // measurable progress while it is being processed.
+                        const LinearProgressIndicator(
+                          borderRadius: BorderRadius.all(Radius.circular(8)),
+                          color: Color(0xFF5145E5),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          '$_done of ${_items.length} finished. Large files can take a while.',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Color(0xFF777B91),
+                          ),
                         ),
                       ],
                       if (_message != null) ...[
@@ -1090,7 +1095,7 @@ class _HomePageState extends State<HomePage> {
                                     ),
                                     const SizedBox(height: 3),
                                     const Text(
-                                      'Watermark successfully applied',
+                                      'Tap save to store it on your device',
                                       style: TextStyle(
                                         color: Color(0xFF62816D),
                                         fontSize: 11,
@@ -1109,7 +1114,7 @@ class _HomePageState extends State<HomePage> {
                         ),
                         const SizedBox(height: 12),
 
-                        // Per-file downloads
+                        // Per-file save
                         for (final item in ready)
                           Container(
                             margin: const EdgeInsets.only(bottom: 8),
@@ -1140,8 +1145,8 @@ class _HomePageState extends State<HomePage> {
                                   ),
                                 ),
                                 IconButton(
-                                  tooltip: 'Download',
-                                  onPressed: () => _saveOne(item),
+                                  tooltip: 'Save / share',
+                                  onPressed: () => _shareFiles([item]),
                                   icon: const Icon(
                                     Icons.download_rounded,
                                     color: Color(0xFF208454),
@@ -1154,16 +1159,12 @@ class _HomePageState extends State<HomePage> {
 
                         const SizedBox(height: 4),
                         FilledButton.icon(
-                          onPressed: ready.length == 1
-                              ? () => _saveOne(ready.first)
-                              : _saveAllZip,
-                          icon: Icon(ready.length == 1
-                              ? Icons.download_rounded
-                              : Icons.folder_zip_rounded),
+                          onPressed: () => _shareFiles(ready),
+                          icon: const Icon(Icons.download_rounded),
                           label: Text(
                             ready.length == 1
-                                ? 'Download watermarked PDF'
-                                : 'Download all (${ready.length} PDFs, ZIP)',
+                                ? 'Save watermarked PDF'
+                                : 'Save all (${ready.length} PDFs)',
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                           style: FilledButton.styleFrom(
@@ -1175,21 +1176,6 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ),
                         ),
-                        if (!kIsWeb) ...[
-                          const SizedBox(height: 9),
-                          OutlinedButton.icon(
-                            onPressed: _shareAll,
-                            icon: const Icon(Icons.share_rounded),
-                            label: Text(
-                                ready.length == 1 ? 'Share PDF' : 'Share all PDFs'),
-                            style: OutlinedButton.styleFrom(
-                              minimumSize: const Size.fromHeight(48),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(14),
-                              ),
-                            ),
-                          ),
-                        ],
                       ],
                     ],
                   ),
